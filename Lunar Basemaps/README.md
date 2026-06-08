@@ -1,95 +1,60 @@
 # Elemental Base Maps
 
-Static heatmaps showing the spatial distribution of 7 major rock-forming elements across the lunar surface, projected onto a lunar albedo basemap.
+Static heatmaps showing the spatial distribution of major rock-forming elements across the lunar surface. Each map overlays color-coded elemental flux ratios onto a lunar albedo basemap, with opacity blending so the underlying geography remains readable.
 
 ---
 
 ## Method
 
-Each row in the catalog CSV describes a 12.5 × 12.5 km CLASS observation footprint as a quadrilateral with 4 corner lat/lon pairs. The heatmap pipeline:
+Each row in the catalog describes a 12.5 × 12.5 km CLASS footprint as a quadrilateral with four corner lat/lon coordinates. The heatmap pipeline:
 
-1. Computes weight-percentage proxy for each element as `element_area / total_area` (Gaussian peak areas, all elements summed, oxygen excluded from the total).
-2. Projects each footprint corner from lat/lon to pixel coordinates using a linear equirectangular mapping.
-3. Draws the quadrilateral outline on an OpenCV canvas with a viridis color value derived from the normalized ratio.
-4. Alpha-composites the overlay onto the basemap using `cv2.addWeighted`.
-
-Two opacity variants are provided per element — **0.4** (data lighter, basemap geography visible) and **0.7** (data dominant, variation easier to read).
+- Computes an elemental weight-percentage proxy for each element as its Gaussian peak area divided by the sum of all element areas. Silicon is excluded from individual maps but used as the normalization reference elsewhere.
+- Projects each footprint's four corners from lat/lon to pixel coordinates using a linear equirectangular mapping onto the basemap image.
+- Draws the quadrilateral outline as a color-coded box using the viridis colormap, normalized independently per element so relative spatial variation is maximally visible.
+- Alpha-composites the full overlay onto the basemap — two opacity variants are generated per element (0.4 for geography-forward, 0.7 for data-forward).
 
 ---
 
-## Results
+## All Elements at a Glance
 
-### Iron (Fe)
+![HEATMAP COMPARISON](../assets/heatmap_comparison.png)
 
-| 0.4 opacity | 0.7 opacity |
-|-------------|-------------|
-| ![Fe 0.4](final_images/Fe_0.4._f.png) | ![Fe 0.7](final_images/Fe_0.7_f.png) |
-
-Fe concentrates strongly in the maria, particularly Oceanus Procellarum. The highlands show markedly lower Fe, consistent with anorthosite-dominated feldspathic crust.
+The bottom-right panel — the Fe–Al–Mg correlation map — is the most diagnostic result. Fe and Mg co-concentrate in the same mare regions while Al is suppressed there, and Al is elevated exactly where Fe and Mg are low. This three-way anti-correlation is the geochemical fingerprint of the fundamental division between the lunar crust types: mafic basaltic maria versus feldspathic anorthosite highlands.
 
 ---
 
-### Magnesium (Mg)
+## Detailed Results
 
-| 0.4 opacity | 0.7 opacity |
-|-------------|-------------|
-| ![Mg 0.4](final_images/Mg_0.4_f.png) | ![Mg 0.7](final_images/Mg_0.7_f.png) |
+![OUR RESULTS](../assets/our_results_Mg_Fe_Al.png)
 
-Mg tracks Fe spatially — both are elevated in mafic mare basalts (pyroxene and olivine-bearing). The anti-correlation with Al is the clearest geochemical signature of the mafic/feldspathic divide.
+**Magnesium** and **Iron** show near-identical spatial patterns, both elevated in Oceanus Procellarum and the major mare basins on the nearside. This is expected — both are concentrated in the ferromagnesian silicates (pyroxene, olivine) that dominate mare basalt mineralogy.
 
----
+**Aluminum** is anti-correlated with both. It peaks in the far-side highlands, where the ancient anorthosite crust is thickest. Anorthosite is dominated by Ca-Al plagioclase feldspar — Al-rich by definition and depleted in Fe and Mg.
 
-### Calcium (Ca)
-
-| 0.4 opacity | 0.7 opacity |
-|-------------|-------------|
-| ![Ca 0.4](final_images/Ca_0.4_f.png) | ![Ca 0.7](final_images/Ca_0.7_f.png) |
-
-Ca shows a more distributed pattern because it appears in both plagioclase (highlands) and pyroxene (mare). It does not cleanly partition between terrains the way Fe and Al do.
+This three-way spatial pattern is not assumed — it emerges from independent Gaussian fits to separate spectral lines. The fact that it reproduces the known mafic/feldspathic divide serves as the primary internal validation of the pipeline.
 
 ---
 
-### Titanium (Ti)
+## Verification Against Published Maps
 
-| 0.4 opacity | 0.7 opacity |
-|-------------|-------------|
-| ![Ti 0.4](final_images/Ti_0.4_f.png) | ![Ti 0.7](final_images/Ti_0.7_f.png) |
+![VERIFICATION](../assets/verification_existing_maps.png)
 
-Ti is elevated in a subset of mare regions — specifically those with Ti-rich ilmenite basalts, consistent with Lunar Prospector and Apollo sample data.
+Our Mg, Fe, and Al distributions are compared against published maps derived from Chang'e-5 sample data combined with deep-learning spectral inversion (Chen Yang et al.). The spatial agreement in all three elements — Mg/Fe concentration in Procellarum, Al ring around the highland crust, Fe depletion in highland terrane — confirms that the Gaussian fitting approach and Si-normalization are producing geochemically consistent results from the CLASS spectra alone.
 
 ---
 
-### Silicon (Si)
+## Individual Element Maps
 
-| 0.4 opacity | 0.7 opacity |
-|-------------|-------------|
-| ![Si 0.4](final_images/Si_0.4_f.png) | ![Si 0.7](final_images/Si_0.7_f.png) |
+The `final_images/` directory contains per-element PNGs at both opacity levels.
 
-Si is broadly uniform, which justifies its use as the normalization reference for element/Si ratios throughout the pipeline.
+| File | Element | Notes |
+|---|---|---|
+| `Fe_*.png` | Iron | Elevated in all major mare basins |
+| `Mg_*.png` | Magnesium | Co-spatial with Fe — mafic minerals |
+| `Al_*.png` | Aluminum | Anti-correlated with Fe/Mg — feldspathic highlands |
+| `Ca_*.png` | Calcium | Present in both feldspar and pyroxene — more distributed |
+| `Ti_*.png` | Titanium | Elevated in Ti-rich ilmenite basalts; subset of maria |
+| `Si_*.png` | Silicon | Broadly uniform — supports its use as normalization reference |
+| `Na_*.png` | Sodium | Lower abundance; concentrated in KREEP-rich terrane |
 
----
-
-### Aluminum (Al)
-
-| 0.7 opacity |
-|-------------|
-| ![Al 0.7](final_images/Al_0.7_f.png) |
-
-Al is highest in the highlands, anti-correlated with Fe and Mg. This is the feldspathic anorthosite signature — Al-rich plagioclase dominates the ancient highland crust.
-
----
-
-## Libraries
-
-```python
-import cv2
-from PIL import Image
-import numpy as np
-import pandas as pd
-import rasterio
-import matplotlib.pyplot as plt
-from matplotlib.colors import Normalize
-from matplotlib.cm import ScalarMappable, get_cmap
-```
-
-Install rasterio if not present: `pip install rasterio`
+Suffix `_0.4` = 40% overlay opacity. Suffix `_0.7` = 70% overlay opacity.

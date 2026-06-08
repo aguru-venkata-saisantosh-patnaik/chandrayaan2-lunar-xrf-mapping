@@ -1,148 +1,104 @@
 # Interactive Lunar Map
 
-The interactive map is a GPU-rendered HTML visualization that places every CLASS XRF observation as a hoverable pin on a lunar albedo basemap. Hovering a point surfaces its Si-normalized elemental ratios and measurement uncertainties — covering 8 elements (O, Na, Mg, Al, Ca, Ti, Mn, Fe) for each 12.5 × 12.5 km observation footprint.
+The interactive map is the primary deliverable of this project — a self-contained HTML file that places every processed CLASS observation as a hoverable pin on a lunar albedo basemap. Hovering any point reveals the full elemental composition of that 12.5 × 12.5 km surface cell: Si-normalised ratios for O, Na, Mg, Al, Ca, Ti, Mn, and Fe, each accompanied by its propagated measurement uncertainty.
 
-The output is a self-contained HTML file. It is heavy (~hundreds of MB of inline data) but requires no server — open it in a browser and the GPU takes over.
+![INTERACTIVE MAP EXAMPLE](../assets/interactive_map_example.png)
 
----
-
-## Why This Needed Careful Engineering
-
-The catalog CSV contains hundreds of thousands of observation rows. A naive SVG-based scatter plot (e.g., standard Plotly Express) collapses under that load — the DOM builds one element per point and the browser freezes long before rendering completes. The two key decisions that make this work at scale are:
-
-1. **GPU-accelerated rendering via WebGL (Scattergl)**
-2. **cKDTree-based spatial regridding instead of per-row iteration**
+The hover card shows lat/lon coordinates alongside all eight element/Si ratios with uncertainties. All of this is accessible at any point on the map, in real time, across hundreds of thousands of data points.
 
 ---
 
-## Stage 1: Spatial Regridding with cKDTree
+## The Engineering Problem
 
-The raw catalog rows each describe an irregular quadrilateral footprint with 4 corner lat/lon pairs. Before rendering, those footprints are mapped to a uniform 0.1° × 0.1° grid that aligns cleanly with pixel coordinates on the basemap image.
+The raw catalog from the spectral pipeline contains well over a hundred thousand observation rows, each describing an irregularly shaped 12.5 km quadrilateral footprint. Plotting this naively — as individual SVG elements in a standard scatter plot — is not viable. The browser DOM builds one element per point, and rendering freezes long before the full dataset is on screen. Interaction is impossible.
 
-```python
-from scipy.spatial import cKDTree
-import numpy as np
+Two interconnected problems needed solving:
 
-# Build a uniform grid covering the full observation extent
-latitudes  = np.arange(lat_min, lat_max, 0.1)
-longitudes = np.arange(lon_min, lon_max, 0.1)
-grid_points = np.array(np.meshgrid(latitudes, longitudes)).T.reshape(-1, 2)
+1. **Geometric irregularity** — the raw footprints are quadrilaterals with four different corner coordinates each. There is no direct path from that structure to a consistent pixel coordinate system on a rectangular basemap image.
+2. **Scale** — the rendered output needs to handle hundreds of thousands of simultaneous data points with interactive hover at each, without freezing the browser.
 
-# Index the catalog by V0 corner coordinates
-tree = cKDTree(df[["V0_lat", "V0_lon"]])
-
-# Single vectorized query — all grid points at once
-distances, indices = tree.query(grid_points)
-
-# Assign element ratios from nearest catalog row to each grid point
-grid_df["Fe/Si_ratio"] = df.iloc[indices]["Fe_area"].values / df.iloc[indices]["Si_area"].values
-```
-
-**Why cKDTree instead of a loop:**
-
-A KD-tree partitions the coordinate space into a binary search tree, reducing nearest-neighbor lookup from O(n) to O(log n) per query. More importantly, `tree.query(grid_points)` accepts the entire grid array at once. NumPy-backed batch queries run in compiled Cython code with no Python loop overhead — the full assignment for hundreds of thousands of grid points completes in under a second. A Python `for` loop over the same data would take minutes.
-
-The result is a clean rectangular grid DataFrame with one row per 0.1° cell, each carrying all 8 element ratios and their uncertainties.
+Both were solved by separating the problem into distinct stages: first normalise the data geometry, then hand the rendering entirely to the GPU.
 
 ---
 
-## Stage 2: Overlap Averaging
+## Stage 1 — Regridding Irregular Footprints onto a Uniform Grid
 
-Where multiple catalog observations fall within the same 0.1° grid cell (overlapping footprints in high-density coverage areas), the ratio values are averaged:
+The quadrilateral footprints from the catalog cannot be projected pixel-by-pixel without expensive polygon intersection logic for every frame. The solution is to abandon the footprint geometry and recast the data onto a regular 0.1° × 0.1° latitude-longitude grid that maps cleanly to pixel coordinates on the basemap.
 
-```python
-grouped_df = (
-    df.groupby(['latitude', 'longitude'], as_index=False)
-    .agg({**{col: 'mean' for col in mean_columns},
-          **{col: 'mean' for col in uncertainty_columns}})
-)
-```
+This is done using a **KD-tree spatial index** built over the catalog's observation coordinates. The full observation extent is covered with a uniform grid of query points at 0.1° spacing. The KD-tree answers the question "which catalog observation is nearest to each grid point?" for all grid points simultaneously — not by looping, but as a single vectorised batch query running in compiled code. Every grid cell inherits the elemental ratios of its nearest observation in one pass. What would take minutes in a Python loop completes in under a second.
 
-This is where the "sub-pixel resolution" comes from: overlapping observations covering the same cell contribute independently fitted spectra, and their average represents finer compositional detail than a single pass would give.
+The result is a clean rectangular grid DataFrame — one row per 0.1° cell, each carrying all eight element/Si ratios and their uncertainties — that maps directly to pixel coordinates with a linear equirectangular formula.
 
 ---
 
-## Stage 3: Pixel Coordinate Mapping
+## Stage 2 — Sub-Pixel Resolution through Overlap Averaging
 
-Lat/lon are converted to pixel coordinates on the basemap image using a simple equirectangular projection:
+Where multiple orbital passes cover the same 0.1° grid cell — which happens frequently at mid-latitudes where ground tracks converge — each pass is an independent spectral measurement of the same surface region. Rather than discarding this redundancy, the pipeline detects duplicate (lat, lon) cells after regridding and averages their ratio values.
 
-```python
-df['x_pixel'] = ((df['Longitude'] + 180) / 360) * img_width
-df['y_pixel'] = ((df['Latitude'] - 90) / 180) * img_height
-```
+![SUBPIXEL METHODOLOGY](../assets/subpixel_methodology.png)
 
-This maps the full −180°→+180° longitude range and −90°→+90° latitude range directly to image pixel space. The y-axis flip (−90 at bottom, +90 at top) is absorbed into the formula. Every data point is then positioned at sub-pixel accuracy relative to the basemap.
+The right panel shows the resulting grid. Dense multi-pass coverage areas resolve compositional detail finer than the native 12.5 km footprint, because each contributing spectrum is fitted independently and the mean of independent fits carries lower uncertainty than any single measurement. This is the sub-pixel resolution enhancement: no interpolation, no upsampling — just the correct statistical treatment of overlapping real measurements.
 
 ---
 
-## Stage 4: GPU Pin-Level Rendering with Scattergl
+## Stage 3 — Pixel Coordinate Mapping
 
-```python
-import plotly.graph_objects as go
+Once the data is on a uniform lat/lon grid, converting to pixel coordinates on the basemap image is a straightforward linear transform — the full −180° to +180° longitude range maps to image width, and −90° to +90° latitude maps to image height with the y-axis flipped to match image convention. Every data point is positioned at sub-pixel precision on the basemap without any reprojection library.
 
-fig.add_trace(
-    go.Scattergl(
-        x=df['x_pixel'],
-        y=df['y_pixel'],
-        mode="markers",
-        marker=dict(size=1, color='blue', opacity=0.25),
-        hovertemplate=(
-            "Lat: %{customdata[0]:.2f}<br>"
-            "Lon: %{customdata[1]:.2f}<br>"
-            "Fe/Si_ratio: %{customdata[9]}<extra></extra>"
-            # ... all 8 elements
-        ),
-        customdata=df[[
-            "latitude", "longitude",
-            "O/Si_ratio", "Na/Si_ratio", "Mg/Si_ratio", "Al/Si_ratio",
-            "Ca/Si_ratio", "Ti/Si_ratio", "Mn/Si_ratio", "Fe/Si_ratio"
-        ]].values
-    )
-)
-```
+---
 
-**`Scattergl` vs `Scatter` — the critical difference:**
+## Stage 4 — GPU Pin-Level Rendering with WebGL
 
-| | `go.Scatter` | `go.Scattergl` |
-|---|---|---|
-| Renderer | SVG (CPU, DOM) | WebGL (GPU, canvas) |
-| Max practical points | ~10,000 before freezing | 1,000,000+ smoothly |
-| Zoom/pan | Lags with large datasets | GPU re-renders in real time |
-| Hover | Same | Same |
+With pixel coordinates computed, the rendering backend determines everything about whether the map is usable.
 
-`Scattergl` delegates the entire rendering pipeline to WebGL. The browser uploads point coordinates and attributes to GPU memory as vertex buffers, and the GPU draws all points simultaneously — each one rendered as a 1×1 pixel pin. The CPU is not involved in the draw loop at all.
+Standard Plotly `Scatter` renders via SVG. The browser creates a DOM node for every single point. At 10,000 points the page starts lagging; at 100,000 it becomes unresponsive; at the scale of this dataset it does not render at all.
 
-With `marker.size=1`, every observation footprint becomes a single screen pixel — the highest resolution the display allows. Dense coverage regions appear as filled areas; sparse coverage reveals individual measurement tracks from the satellite's orbital passes.
+**`Scattergl`** routes the entire render pipeline through **WebGL** — the browser's interface to the GPU. Instead of DOM nodes, point coordinates and attributes are uploaded once as compact vertex buffers directly into GPU memory. The GPU then draws all points in parallel across its thousands of shader cores. The CPU is not involved in the draw loop. Zoom, pan, and hover interactions trigger a GPU redraw that completes in milliseconds regardless of point count.
 
-**`customdata` for hover without layout overhead:**
+Each observation is rendered at `size=1` — a single screen pixel, the finest spatial resolution the display allows. This is intentional: at this scale, dense coverage regions appear as filled areas reflecting actual data density, while sparse tracks from individual orbital passes remain individually visible. It is a direct visual representation of coverage, not an artificial smoothing.
 
-All 8 element ratios per point are packed into `customdata` at render time and stored client-side in the WebGL buffer. The `hovertemplate` reads directly from that buffer — no event callbacks, no data fetches, no layout recalculations. Hover response is instantaneous even on the full dataset.
+| Renderer | Backend | Practical limit | Zoom/pan at scale |
+|---|---|---|---|
+| Scatter | SVG / CPU DOM | ~10,000 points | Freezes |
+| Scattergl | WebGL / GPU | 1,000,000+ points | Real-time |
+
+**Why hover still works at this scale:** all eight element ratios for every point are packed into the `customdata` buffer and uploaded to GPU memory at render time. When you hover a point, the browser reads directly from that buffer — no event callbacks, no server requests, no layout recalculations. The hover card appears instantly because the data is already in the right place.
 
 ---
 
 ## Data Preparation Flow
 
 ```
-endfinal_individualfin1.csv          (raw catalog: irregular footprints, element areas)
-          │
-          ▼
-  cKDTree nearest-neighbor regrid to 0.1° uniform grid
-          │
-          ▼
-  Ratio computation: element_area / Si_area
-          │
-          ▼
-  Overlap deduplication: group by (lat, lon), mean-aggregate
-          │
-          ▼
-  final_map_interactive_updated.csv   (uniform grid, ratio ± uncertainty per cell)
-          │
-          ▼
-  Pixel coordinate mapping (equirectangular)
-          │
-          ▼
-  Scattergl render → interactive_map.html
+Raw catalog CSV
+(irregular quadrilateral footprints, 9 element areas per row)
+        │
+        ▼
+KD-tree nearest-neighbour regrid → uniform 0.1° grid
+        │
+        ▼
+Element/Si ratio computation per cell
+        │
+        ▼
+Overlap deduplication — mean-aggregate duplicate cells
+(sub-pixel resolution enhancement)
+        │
+        ▼
+Equirectangular lat/lon → pixel coordinate mapping
+        │
+        ▼
+WebGL Scattergl render on lunar albedo basemap
+        │
+        ▼
+Self-contained interactive HTML output
 ```
+
+---
+
+## What the Map Shows
+
+- **Ratios, not raw counts** — all values are normalised to Si, which is homogeneously distributed across the lunar surface. This removes solar flux variation as a confound: a high Fe/Si ratio means Fe is genuinely enriched relative to the surface average, not that the observation happened during a strong flare.
+- **Uncertainty at every point** — the hover card shows the propagated spectral overlap uncertainty alongside each ratio. Points near spectral overlap regions (e.g., where Mg and Al peaks interfere) carry higher uncertainty, visible directly in the map.
+- **Coverage as a visual signal** — the density of rendered pins is a direct proxy for data coverage. Mare regions with many overlapping orbital passes appear dense; polar regions with sparse tracks appear as individual lines.
 
 ---
 
@@ -150,19 +106,8 @@ endfinal_individualfin1.csv          (raw catalog: irregular footprints, element
 
 | File | Description |
 |---|---|
-| [`interactive_web_map.ipynb`](interactive_web_map.ipynb) | Final rendering notebook (Scattergl + basemap) |
-| [`CSV Preparation of interactive_web_map.ipynb`](CSV%20Preparation%20of%20interactive_web_map.ipynb) | cKDTree regridding + overlap averaging |
-| [`final_interactive_map_ratios_data.csv.zip`](final_interactive_map_ratios_data.csv.zip) | Processed grid CSV (ratio ± uncertainty per cell) |
-| [`individual_raw_fits_data.csv.zip`](individual_raw_fits_data.csv.zip) | Raw catalog output from Gaussian pipeline |
-| [`interactive_map_demo.html`](interactive_map_demo.html) | Rendered interactive map |
-
----
-
-## Running Locally
-
-```bash
-pip install plotly pandas numpy scipy Pillow
-jupyter notebook interactive_web_map.ipynb
-```
-
-The HTML output requires a browser with WebGL enabled (all modern browsers do by default). For the full dataset, 8–16 GB RAM is recommended.
+| `interactive_web_map.ipynb` | Final rendering notebook — basemap + Scattergl trace |
+| `CSV Preparation of interactive_web_map.ipynb` | KD-tree regridding and overlap averaging |
+| `final_interactive_map_ratios_data.csv.zip` | Processed grid (ratio ± uncertainty per 0.1° cell) |
+| `individual_raw_fits_data.csv.zip` | Raw catalog output from the Gaussian pipeline |
+| `interactive_map_demo.html` | Rendered interactive map |

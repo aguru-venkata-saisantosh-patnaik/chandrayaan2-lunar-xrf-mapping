@@ -90,11 +90,19 @@ The catalog structure:
 
 ### Stage 5 — Map Creation: Sub-Pixel Resolution via Grid Regridding
 
-The 12.5 km native footprint is coarser than what the data density actually supports. Where multiple orbital passes overlap — which happens frequently at mid-latitudes — each observation is an independent spectral measurement of the same cell. Rather than discarding this redundancy, the pipeline regrides to a 0.1° uniform grid (finer than the native footprint) and **averages all observations that fall within each cell**. This is the sub-pixel enhancement: overlapping measurements contribute independently fitted spectra, and their weighted mean represents finer compositional detail than any single pass.
+**The engineering problem:** The catalog rows describe observation footprints as irregular quadrilaterals — four corner lat/lon pairs per row, with no guaranteed alignment between consecutive observations. You cannot directly project these onto a basemap image without either doing expensive polygon intersection logic per frame, or accepting that overlapping tracks are handled inconsistently. Neither is acceptable when the goal is a uniform, hoverable map covering the entire Moon.
+
+The second problem is redundancy. At mid-latitudes, multiple orbital passes cover the same surface patch from slightly different angles. The naive approach — take the last observation to land in a pixel — throws away every earlier measurement. But each pass is an independent spectral fit, and independent measurements of the same cell average down to lower uncertainty than any single one.
+
+**The solution — KD-tree regridding onto a uniform grid:**
+
+Instead of working with the raw quadrilateral footprints, the entire observation space is recast onto a regular 0.1° × 0.1° latitude-longitude grid. A KD-tree spatial index is built over the catalog's corner coordinates. Every point on the uniform grid then queries the KD-tree for its nearest catalog observation — not by iterating, but as a single vectorised batch query across all grid points simultaneously, running in compiled code. The full assignment for hundreds of thousands of grid cells completes in under a second. A Python loop over the same data would take minutes.
+
+Where multiple catalog rows map to the same grid cell — the overlap case — their ratio values are mean-averaged. This is the sub-pixel enhancement: overlapping measurements contribute independently fitted spectra, and their mean carries lower uncertainty than any single pass. The 0.1° grid is finer than the native 12.5 km footprint, so the effective resolution improves wherever coverage is dense, without any interpolation or upsampling.
 
 ![SUBPIXEL METHODOLOGY](assets/subpixel_methodology.png)
 
-The right panel shows the resulting grid — visually denser and more uniform than the irregular orbital track coverage on the left.
+The right panel shows the resulting uniform grid laid over the lunar basemap. The irregular orbital track geometry from the left is gone — replaced by a clean rectangular structure that maps directly to pixel coordinates and is ready for rendering.
 
 ---
 
